@@ -1,0 +1,55 @@
+name: deep-health-probe
+
+# External service monitor. Runs on GitHub-hosted runners — deliberately
+# OUTSIDE the platform that hosts the service, so it survives the outages it
+# exists to report. The ALERT is the failed workflow run: GitHub notifies the
+# workflow author (email + GitHub mobile push) on every failure.
+#
+# This workflow gates nothing. It is not CI and no deploy waits on it.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: 'Deliberate failure test: fail the run to prove the alert fires'
+        required: false
+        default: 'false'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe deep health endpoint
+        env:
+          PROBE_URL: ${{ secrets.PROBE_URL }}
+        run: |
+          if [ "${{ github.event.inputs.force_fail }}" = "true" ]; then
+            echo "::error::FORCED FAILURE — deliberate alert-path test, service was NOT probed"
+            exit 1
+          fi
+          if [ -z "$PROBE_URL" ]; then
+            echo "::error::PROBE_URL secret is not set — monitor cannot probe anything"
+            exit 1
+          fi
+          # Two attempts 60s apart: one transient blip must not page anyone,
+          # but a real outage must never be absorbed.
+          for attempt in 1 2; do
+            set +e
+            body=$(curl -sS --max-time 20 -w '\n%{http_code}' "$PROBE_URL" 2>&1)
+            rc=$?
+            set -e
+            code=$(printf '%s' "$body" | tail -n1)
+            json=$(printf '%s' "$body" | sed '$d')
+            echo "attempt $attempt: curl rc=$rc HTTP $code"
+            echo "$json"
+            if [ $rc -eq 0 ] && [ "$code" = "200" ] && printf '%s' "$json" | grep -q '"ok":true'; then
+              echo "healthy"
+              exit 0
+            fi
+            [ "$attempt" = "1" ] && sleep 60
+          done
+          echo "::error::deep health probe failed on 2 attempts 60s apart"
+          exit 1
