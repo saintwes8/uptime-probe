@@ -53,3 +53,98 @@ jobs:
           done
           echo "::error::deep health probe failed on 2 attempts 60s apart"
           exit 1
+
+  relay:
+    # The relay is a single Hetzner box and the ONLY thing that made remote
+    # viewing cheap. Nothing watched it until now: /health/deep goes red when
+    # the AGENT detaches, which is a different fact from the relay host being
+    # gone, and it stays green while the relay is unreachable to everyone else.
+    #
+    # Two assertions, deliberately no more:
+    #   liveness — the box answers at all. This is the 3am-outage case.
+    #   churn    — attachments REPLACED between two samples. The `attachments`
+    #              gauge reads 1 whether that is one healthy agent or two
+    #              evicting each other 45x/minute, which is exactly what
+    #              happened for days in Aug 2026. A gauge cannot express churn;
+    #              only a delta on a monotonic counter can.
+    #
+    # It does NOT alert on attachment LEVEL. Zero attachments is a normal
+    # recorder-is-off night, and paging on it would make this monitor noise.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe relay liveness and attachment churn
+        env:
+          RELAY_PROBE_URL: ${{ secrets.RELAY_PROBE_URL }}
+        run: |
+          if [ -z "$RELAY_PROBE_URL" ]; then
+            echo "::error::RELAY_PROBE_URL secret is not set — relay is unmonitored"
+            exit 1
+          fi
+
+          sample() {
+            curl -sS --max-time 20 -w '\n%{http_code}' "$RELAY_PROBE_URL" 2>&1
+          }
+          field() {
+            printf '%s' "$2" | tr -d ' ' | sed -nE "s/.*\"$1\":([0-9]+).*/\1/p"
+          }
+
+          first_json=''
+          for attempt in 1 2; do
+            set +e; body=$(sample); rc=$?; set -e
+            code=$(printf '%s' "$body" | tail -n1)
+            json=$(printf '%s' "$body" | sed '$d')
+            echo "attempt $attempt: curl rc=$rc HTTP $code"
+            echo "$json"
+            if [ $rc -eq 0 ] && [ "$code" = "200" ] && printf '%s' "$json" | tr -d ' ' | grep -q '"ok":true'; then
+              first_json="$json"
+              break
+            fi
+            if [ "$attempt" = "2" ]; then
+              echo "::error::RELAY UNREACHABLE — no ok:true from the relay host on 2 attempts 60s apart. Remote viewing is falling back to the cloud rung at ~50x the egress cost, or failing."
+              exit 1
+            fi
+            sleep 60
+          done
+
+          # Churn needs a second sample and a monotonic counter. The counter
+          # ships in relay `/health` only from backend main after 2026-08-24; if
+          # the box is running an older image the field is absent and we skip
+          # this check rather than inventing a reading from the gauge.
+          replaced_before=$(field attachmentsReplacedTotal "$first_json")
+          if [ -z "$replaced_before" ]; then
+            echo "notice: attachmentsReplacedTotal absent — relay predates the churn counters, churn NOT checked"
+            echo "relay live; churn unchecked"
+            exit 0
+          fi
+
+          sleep 60
+          set +e; body=$(sample); rc=$?; set -e
+          code=$(printf '%s' "$body" | tail -n1)
+          json=$(printf '%s' "$body" | sed '$d')
+          if [ $rc -ne 0 ] || [ "$code" != "200" ]; then
+            echo "::error::RELAY UNREACHABLE on the churn sample (rc=$rc HTTP $code) after answering 60s earlier"
+            exit 1
+          fi
+          replaced_after=$(field attachmentsReplacedTotal "$json")
+          uptime_after=$(field uptimeSec "$json")
+          uptime_before=$(field uptimeSec "$first_json")
+
+          # A relay restart resets the counter; a negative delta is a restart,
+          # not calm. Report it and skip rather than reading it as zero churn.
+          if [ -n "$uptime_before" ] && [ -n "$uptime_after" ] && [ "$uptime_after" -lt "$uptime_before" ]; then
+            echo "::error::RELAY RESTARTED between samples (uptimeSec $uptime_before -> $uptime_after). Unplanned restarts on this box mean an OOM or a crash loop; the containers currently run with no memory cap."
+            exit 1
+          fi
+
+          delta=$(( replaced_after - replaced_before ))
+          echo "attachmentsReplacedTotal: $replaced_before -> $replaced_after (delta $delta over ~60s)"
+
+          # 0 is healthy. 1-4 covers a legitimate recorder restart or a single
+          # arbitration handover. The pathological case measured ~45/min.
+          if [ "$delta" -ge 5 ]; then
+            echo "::error::RELAY ATTACHMENT CHURN — $delta replacements in ~60s. Two agents are evicting each other; viewers see the stream drop repeatedly. The attachments gauge reads normal throughout."
+            exit 1
+          fi
+
+          echo "relay live; churn $delta/60s"
