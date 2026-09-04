@@ -1,0 +1,71 @@
+name: backend-main-red
+
+# Row 158. Alerts when airdvr-backend's `main` has been RED for more than an
+# hour — and, just as importantly, when it cannot tell.
+#
+# WHAT THIS WATCHES THAT probe.yml DOES NOT. probe.yml asks "is the service
+# answering". A service serving last week's code answers perfectly. `main` in
+# airdvr-backend is the deploy branch and Railway gates the deploy on the
+# Suite's result, so a red `main` is a production deploy that is silently not
+# happening, with no failing request anywhere to notice it by. Same family as
+# the two faults `/health/deep` already covers: observable only as an absence.
+#
+# WHY IT IS HOSTED HERE. An alarm inside the repo it watches dies with it.
+# airdvr-backend is private, so its Actions minutes are billed, and a $0 budget
+# has already stopped dispatches on this account once without saying so. Under
+# that failure an in-repo alarm and the CI it watches stop together and the
+# silence reads as success. This repo is public, its minutes are free, and its
+# schedule is held open by keepalive.yml against GitHub's 60-day rule.
+#
+# THE ALERT IS THE FAILED RUN, exactly as in probe.yml. This workflow gates
+# nothing and no deploy waits on it.
+#
+# CREDENTIAL. airdvr-backend is PRIVATE, so this repo's GITHUB_TOKEN cannot see
+# it. `BACKEND_ACTIONS_TOKEN` must be a fine-grained PAT scoped to
+# saintwes8/airdvr-backend with `Actions: Read-only` and nothing else. Until it
+# is set, every run FAILS and says so — deliberately. A monitor that goes quiet
+# because it has no credential is the precise failure this row exists to end,
+# so "not configured" alerts like any other blindness rather than passing.
+
+on:
+  schedule:
+    # Hourly. The grace below is an hour, so a finer cadence could not report
+    # anything sooner; it would only multiply the notification for one outage.
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: 'Deliberate failure test: fail the run to prove the alert fires'
+        required: false
+        default: 'false'
+
+jobs:
+  main-red:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deliberate failure test
+        if: ${{ github.event.inputs.force_fail == 'true' }}
+        run: |
+          echo "::error::FORCED FAILURE — deliberate alert-path test, main was NOT read"
+          exit 1
+
+      - name: Prove the verdict function in both directions before trusting it
+        # The drill is offline and deterministic, and it runs on every scheduled
+        # check rather than only in a PR. It costs three seconds and it means a
+        # green run is a run whose judgement was demonstrated on this commit,
+        # including the controls that a stuck always-alert or always-quiet
+        # function would fail.
+        run: node test/drill.mjs
+
+      - name: Has backend main been red for over an hour?
+        env:
+          GH_TOKEN: ${{ secrets.BACKEND_ACTIONS_TOKEN }}
+          WATCH_OWNER: saintwes8
+          WATCH_REPO: airdvr-backend
+          WATCH_BRANCH: main
+          RED_GRACE_MIN: '60'
+          STALE_DAYS: '14'
+        run: node scripts/main-red.mjs
