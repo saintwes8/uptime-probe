@@ -6,6 +6,15 @@ the workflow author by email and mobile push on failure.
 
 - `probe.yml` — every 10 minutes; 2 attempts 60s apart; requires HTTP 200 and
   `"ok":true` in the body.
+- `probe.yml` `relay` job — same schedule, URL in the `RELAY_PROBE_URL`
+  secret (the relay's `/health`). Three assertions: **liveness** (200 +
+  `ok:true`, 2 attempts 60s apart); **capacity** (alert when `attachments` is
+  at or above 80% of `maxAttachments` — the cap is a hard refusal, so this
+  fires before it binds); **churn** (`attachmentsReplacedTotal` sampled twice
+  60s apart, alert at >=5, and alert if `uptimeSec` goes backwards). It does
+  NOT alert on low attachment level: zero is a normal recorder-off night.
+  Drill: point `RELAY_PROBE_URL` at a dead port, dispatch, confirm the failure
+  notification, point it back.
 - `main-red.yml` — hourly; alerts when `saintwes8/airdvr-backend`'s `main` has
   been RED for more than 60 minutes, and **also when it cannot tell**: no runs,
   no completed runs, only cancellations, a malformed payload, a missing or
