@@ -68,7 +68,11 @@ jobs:
     #              happened for days in Aug 2026. A gauge cannot express churn;
     #              only a delta on a monotonic counter can.
     #
-    # It does NOT alert on attachment LEVEL. Zero attachments is a normal
+    #   capacity — attachments at or above 80% of maxAttachments. The cap is a
+    #              hard refusal: the next recorder past it never attaches and
+    #              its viewers fall to the cloud rung. Alert BEFORE it binds.
+    #
+    # It does NOT alert on LOW attachment level. Zero attachments is a normal
     # recorder-is-off night, and paging on it would make this monitor noise.
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -106,6 +110,20 @@ jobs:
             fi
             sleep 60
           done
+
+          # Capacity: high side only (see the job comment). Integer arithmetic,
+          # so 80% of 128 alerts at 103, not at 102.
+          att=$(field attachments "$first_json")
+          cap=$(field maxAttachments "$first_json")
+          if [ -n "$att" ] && [ -n "$cap" ] && [ "$cap" -gt 0 ]; then
+            echo "attachments: $att / $cap"
+            if [ $(( att * 100 )) -ge $(( cap * 80 )) ]; then
+              echo "::error::RELAY NEAR CAPACITY — $att of $cap attachments (>=80%). The next recorder past the cap is REFUSED and its viewers fall to the cloud rung. Raise RELAY_MAX_ATTACHMENTS on the box or add a relay."
+              exit 1
+            fi
+          else
+            echo "notice: attachments/maxAttachments absent from /health — capacity NOT checked"
+          fi
 
           # Churn needs a second sample and a monotonic counter. The counter
           # ships in relay `/health` only from backend main after 2026-08-24; if
