@@ -1,8 +1,17 @@
 # uptime-probe
 
 Scheduled external probe of a service's deep-health endpoint (URL held in the
-`PROBE_URL` Actions secret). A failed run **is** the alert — GitHub notifies
-the workflow author by email and mobile push on failure.
+`PROBE_URL` Actions secret).
+
+**The alert is one GitHub issue per red condition, not the run result**
+(`scripts/probe-state.sh`, since 2026-09-24). A red verdict opens the issue
+once; while it stays red nothing more is sent; when the probe reads green the
+issue closes itself with a comment. Two mails per incident, start and clear.
+Between 2026-09-14 and 09-24 the old "a failed run is the alert" design mailed
+the same unchanged fact 132 times across two probes and stopped being read. A
+scheduled run therefore never fails; a `workflow_dispatch` run still reports
+the verdict as its result, so `force_fail=true` shows red to the person who
+pressed it and opens the issue, which the next green run closes.
 
 - `probe.yml` — every 10 minutes; 2 attempts 60s apart; requires HTTP 200 and
   `"ok":true` in the body.
