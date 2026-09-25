@@ -17,43 +17,61 @@ on:
         required: false
         default: 'false'
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   probe:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v4
       - name: Probe deep health endpoint
+        id: deep
+        continue-on-error: true
         env:
           PROBE_URL: ${{ secrets.PROBE_URL }}
         run: |
-          if [ "${{ github.event.inputs.force_fail }}" = "true" ]; then
-            echo "::error::FORCED FAILURE — deliberate alert-path test, service was NOT probed"
-            exit 1
-          fi
-          if [ -z "$PROBE_URL" ]; then
-            echo "::error::PROBE_URL secret is not set — monitor cannot probe anything"
-            exit 1
-          fi
-          # Two attempts 60s apart: one transient blip must not page anyone,
-          # but a real outage must never be absorbed.
-          for attempt in 1 2; do
-            set +e
-            body=$(curl -sS --max-time 20 -w '\n%{http_code}' "$PROBE_URL" 2>&1)
-            rc=$?
-            set -e
-            code=$(printf '%s' "$body" | tail -n1)
-            json=$(printf '%s' "$body" | sed '$d')
-            echo "attempt $attempt: curl rc=$rc HTTP $code"
-            echo "$json"
-            if [ $rc -eq 0 ] && [ "$code" = "200" ] && printf '%s' "$json" | grep -q '"ok":true'; then
-              echo "healthy"
-              exit 0
+          set -o pipefail
+          {
+            if [ "${{ github.event.inputs.force_fail }}" = "true" ]; then
+              echo "::error::FORCED FAILURE — deliberate alert-path test, service was NOT probed"
+              exit 1
             fi
-            [ "$attempt" = "1" ] && sleep 60
-          done
-          echo "::error::deep health probe failed on 2 attempts 60s apart"
-          exit 1
+            if [ -z "$PROBE_URL" ]; then
+              echo "::error::PROBE_URL secret is not set — monitor cannot probe anything"
+              exit 1
+            fi
+            # Two attempts 60s apart: one transient blip must not page anyone,
+            # but a real outage must never be absorbed.
+            for attempt in 1 2; do
+              set +e
+              body=$(curl -sS --max-time 20 -w '\n%{http_code}' "$PROBE_URL" 2>&1)
+              rc=$?
+              set -e
+              code=$(printf '%s' "$body" | tail -n1)
+              json=$(printf '%s' "$body" | sed '$d')
+              echo "attempt $attempt: curl rc=$rc HTTP $code"
+              echo "$json"
+              if [ $rc -eq 0 ] && [ "$code" = "200" ] && printf '%s' "$json" | grep -q '"ok":true'; then
+                echo "healthy"
+                exit 0
+              fi
+              [ "$attempt" = "1" ] && sleep 60
+            done
+            echo "::error::deep health probe failed on 2 attempts 60s apart"
+            exit 1
 
+          } 2>&1 | tee deep.log
+      - name: Say it once when it starts, once when it clears
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/probe-state.sh "deep-health probe RED: api /health/deep is not ok" "${{ steps.deep.outcome == 'success' && 'green' || 'red' }}" deep.log
+      - name: A manual run still shows its verdict as the run result
+        if: github.event_name == 'workflow_dispatch' && steps.deep.outcome != 'success'
+        run: exit 1
   relay:
     # The relay is a single Hetzner box and the ONLY thing that made remote
     # viewing cheap. Nothing watched it until now: /health/deep goes red when
@@ -77,92 +95,107 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v4
       - name: Probe relay liveness and attachment churn
+        id: relay
+        continue-on-error: true
         env:
           RELAY_PROBE_URL: ${{ secrets.RELAY_PROBE_URL }}
         run: |
-          if [ -z "$RELAY_PROBE_URL" ]; then
-            echo "::error::RELAY_PROBE_URL secret is not set — relay is unmonitored"
-            exit 1
-          fi
+          set -o pipefail
+          {
+            if [ -z "$RELAY_PROBE_URL" ]; then
+              echo "::error::RELAY_PROBE_URL secret is not set — relay is unmonitored"
+              exit 1
+            fi
 
-          sample() {
-            curl -sS --max-time 20 -w '\n%{http_code}' "$RELAY_PROBE_URL" 2>&1
-          }
-          field() {
-            printf '%s' "$2" | tr -d ' ' | sed -nE "s/.*\"$1\":([0-9]+).*/\1/p"
-          }
+            sample() {
+              curl -sS --max-time 20 -w '\n%{http_code}' "$RELAY_PROBE_URL" 2>&1
+            }
+            field() {
+              printf '%s' "$2" | tr -d ' ' | sed -nE "s/.*\"$1\":([0-9]+).*/\1/p"
+            }
 
-          first_json=''
-          for attempt in 1 2; do
+            first_json=''
+            for attempt in 1 2; do
+              set +e; body=$(sample); rc=$?; set -e
+              code=$(printf '%s' "$body" | tail -n1)
+              json=$(printf '%s' "$body" | sed '$d')
+              echo "attempt $attempt: curl rc=$rc HTTP $code"
+              echo "$json"
+              if [ $rc -eq 0 ] && [ "$code" = "200" ] && printf '%s' "$json" | tr -d ' ' | grep -q '"ok":true'; then
+                first_json="$json"
+                break
+              fi
+              if [ "$attempt" = "2" ]; then
+                echo "::error::RELAY UNREACHABLE — no ok:true from the relay host on 2 attempts 60s apart. Remote viewing is falling back to the cloud rung at ~50x the egress cost, or failing."
+                exit 1
+              fi
+              sleep 60
+            done
+
+            # Capacity: high side only (see the job comment). Integer arithmetic,
+            # so 80% of 128 alerts at 103, not at 102.
+            att=$(field attachments "$first_json")
+            cap=$(field maxAttachments "$first_json")
+            if [ -n "$att" ] && [ -n "$cap" ] && [ "$cap" -gt 0 ]; then
+              echo "attachments: $att / $cap"
+              if [ $(( att * 100 )) -ge $(( cap * 80 )) ]; then
+                echo "::error::RELAY NEAR CAPACITY — $att of $cap attachments (>=80%). The next recorder past the cap is REFUSED and its viewers fall to the cloud rung. Raise RELAY_MAX_ATTACHMENTS on the box or add a relay."
+                exit 1
+              fi
+            else
+              echo "notice: attachments/maxAttachments absent from /health — capacity NOT checked"
+            fi
+
+            # Churn needs a second sample and a monotonic counter. The counter
+            # ships in relay `/health` only from backend main after 2026-08-24; if
+            # the box is running an older image the field is absent and we skip
+            # this check rather than inventing a reading from the gauge.
+            replaced_before=$(field attachmentsReplacedTotal "$first_json")
+            if [ -z "$replaced_before" ]; then
+              echo "notice: attachmentsReplacedTotal absent — relay predates the churn counters, churn NOT checked"
+              echo "relay live; churn unchecked"
+              exit 0
+            fi
+
+            sleep 60
             set +e; body=$(sample); rc=$?; set -e
             code=$(printf '%s' "$body" | tail -n1)
             json=$(printf '%s' "$body" | sed '$d')
-            echo "attempt $attempt: curl rc=$rc HTTP $code"
-            echo "$json"
-            if [ $rc -eq 0 ] && [ "$code" = "200" ] && printf '%s' "$json" | tr -d ' ' | grep -q '"ok":true'; then
-              first_json="$json"
-              break
-            fi
-            if [ "$attempt" = "2" ]; then
-              echo "::error::RELAY UNREACHABLE — no ok:true from the relay host on 2 attempts 60s apart. Remote viewing is falling back to the cloud rung at ~50x the egress cost, or failing."
+            if [ $rc -ne 0 ] || [ "$code" != "200" ]; then
+              echo "::error::RELAY UNREACHABLE on the churn sample (rc=$rc HTTP $code) after answering 60s earlier"
               exit 1
             fi
-            sleep 60
-          done
+            replaced_after=$(field attachmentsReplacedTotal "$json")
+            uptime_after=$(field uptimeSec "$json")
+            uptime_before=$(field uptimeSec "$first_json")
 
-          # Capacity: high side only (see the job comment). Integer arithmetic,
-          # so 80% of 128 alerts at 103, not at 102.
-          att=$(field attachments "$first_json")
-          cap=$(field maxAttachments "$first_json")
-          if [ -n "$att" ] && [ -n "$cap" ] && [ "$cap" -gt 0 ]; then
-            echo "attachments: $att / $cap"
-            if [ $(( att * 100 )) -ge $(( cap * 80 )) ]; then
-              echo "::error::RELAY NEAR CAPACITY — $att of $cap attachments (>=80%). The next recorder past the cap is REFUSED and its viewers fall to the cloud rung. Raise RELAY_MAX_ATTACHMENTS on the box or add a relay."
+            # A relay restart resets the counter; a negative delta is a restart,
+            # not calm. Report it and skip rather than reading it as zero churn.
+            if [ -n "$uptime_before" ] && [ -n "$uptime_after" ] && [ "$uptime_after" -lt "$uptime_before" ]; then
+              echo "::error::RELAY RESTARTED between samples (uptimeSec $uptime_before -> $uptime_after). Unplanned restarts on this box mean an OOM or a crash loop; the containers currently run with no memory cap."
               exit 1
             fi
-          else
-            echo "notice: attachments/maxAttachments absent from /health — capacity NOT checked"
-          fi
 
-          # Churn needs a second sample and a monotonic counter. The counter
-          # ships in relay `/health` only from backend main after 2026-08-24; if
-          # the box is running an older image the field is absent and we skip
-          # this check rather than inventing a reading from the gauge.
-          replaced_before=$(field attachmentsReplacedTotal "$first_json")
-          if [ -z "$replaced_before" ]; then
-            echo "notice: attachmentsReplacedTotal absent — relay predates the churn counters, churn NOT checked"
-            echo "relay live; churn unchecked"
-            exit 0
-          fi
+            delta=$(( replaced_after - replaced_before ))
+            echo "attachmentsReplacedTotal: $replaced_before -> $replaced_after (delta $delta over ~60s)"
 
-          sleep 60
-          set +e; body=$(sample); rc=$?; set -e
-          code=$(printf '%s' "$body" | tail -n1)
-          json=$(printf '%s' "$body" | sed '$d')
-          if [ $rc -ne 0 ] || [ "$code" != "200" ]; then
-            echo "::error::RELAY UNREACHABLE on the churn sample (rc=$rc HTTP $code) after answering 60s earlier"
-            exit 1
-          fi
-          replaced_after=$(field attachmentsReplacedTotal "$json")
-          uptime_after=$(field uptimeSec "$json")
-          uptime_before=$(field uptimeSec "$first_json")
+            # 0 is healthy. 1-4 covers a legitimate recorder restart or a single
+            # arbitration handover. The pathological case measured ~45/min.
+            if [ "$delta" -ge 5 ]; then
+              echo "::error::RELAY ATTACHMENT CHURN — $delta replacements in ~60s. Two agents are evicting each other; viewers see the stream drop repeatedly. The attachments gauge reads normal throughout."
+              exit 1
+            fi
 
-          # A relay restart resets the counter; a negative delta is a restart,
-          # not calm. Report it and skip rather than reading it as zero churn.
-          if [ -n "$uptime_before" ] && [ -n "$uptime_after" ] && [ "$uptime_after" -lt "$uptime_before" ]; then
-            echo "::error::RELAY RESTARTED between samples (uptimeSec $uptime_before -> $uptime_after). Unplanned restarts on this box mean an OOM or a crash loop; the containers currently run with no memory cap."
-            exit 1
-          fi
+            echo "relay live; churn $delta/60s"
 
-          delta=$(( replaced_after - replaced_before ))
-          echo "attachmentsReplacedTotal: $replaced_before -> $replaced_after (delta $delta over ~60s)"
-
-          # 0 is healthy. 1-4 covers a legitimate recorder restart or a single
-          # arbitration handover. The pathological case measured ~45/min.
-          if [ "$delta" -ge 5 ]; then
-            echo "::error::RELAY ATTACHMENT CHURN — $delta replacements in ~60s. Two agents are evicting each other; viewers see the stream drop repeatedly. The attachments gauge reads normal throughout."
-            exit 1
-          fi
-
-          echo "relay live; churn $delta/60s"
+          } 2>&1 | tee relay.log
+      - name: Say it once when it starts, once when it clears
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/probe-state.sh "relay probe RED: relay liveness, capacity or churn" "${{ steps.relay.outcome == 'success' && 'green' || 'red' }}" relay.log
+      - name: A manual run still shows its verdict as the run result
+        if: github.event_name == 'workflow_dispatch' && steps.relay.outcome != 'success'
+        run: exit 1

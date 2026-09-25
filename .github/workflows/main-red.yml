@@ -39,6 +39,10 @@ on:
         required: false
         default: 'false'
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   main-red:
     runs-on: ubuntu-latest
@@ -61,6 +65,8 @@ jobs:
         run: node test/drill.mjs
 
       - name: Has backend main been red for over an hour?
+        id: mainred
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.BACKEND_ACTIONS_TOKEN }}
           WATCH_OWNER: saintwes8
@@ -68,4 +74,14 @@ jobs:
           WATCH_BRANCH: main
           RED_GRACE_MIN: '60'
           STALE_DAYS: '14'
-        run: node scripts/main-red.mjs
+        run: |
+          set -o pipefail
+          node scripts/main-red.mjs 2>&1 | tee mainred.log
+      - name: Say it once when it starts, once when it clears
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/probe-state.sh "backend-main-red RED: airdvr-backend main is red or cannot be read" "${{ steps.mainred.outcome == 'success' && 'green' || 'red' }}" mainred.log
+      - name: A manual run still shows its verdict as the run result
+        if: github.event_name == 'workflow_dispatch' && steps.mainred.outcome != 'success'
+        run: exit 1
